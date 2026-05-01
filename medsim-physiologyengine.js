@@ -32,15 +32,17 @@ var P = {
 // Age-based normal vitals
 // Returns {hr, sbp, dbp, rr, weight_kg} for a given age in years
 function ageNorms(ageyrs) {
-  if(ageyrs < 0.08)  return {hr:140,sbp:70, dbp:45,rr:40,weight:3.5,label:'Neonate'};
-  if(ageyrs < 0.5)   return {hr:140,sbp:80, dbp:50,rr:36,weight:5,  label:'Young infant'};
-  if(ageyrs < 1)     return {hr:130,sbp:85, dbp:55,rr:30,weight:8,  label:'Infant'};
-  if(ageyrs < 2)     return {hr:120,sbp:90, dbp:58,rr:26,weight:11, label:'Toddler'};
-  if(ageyrs < 5)     return {hr:105,sbp:95, dbp:62,rr:22,weight:16, label:'Preschool'};
-  if(ageyrs < 8)     return {hr:95, sbp:100,dbp:65,rr:20,weight:23, label:'School age'};
-  if(ageyrs < 12)    return {hr:88, sbp:105,dbp:68,rr:18,weight:35, label:'Older child'};
-  if(ageyrs < 16)    return {hr:80, sbp:112,dbp:72,rr:16,weight:55, label:'Adolescent'};
-  return               {hr:72, sbp:120,dbp:80,rr:14,weight:70, label:'Adult'};
+  // Values reflect anesthetized patient, 25-50th percentile
+  // BP ~15-20% lower than awake norms
+  if(ageyrs < 0.08)  return {hr:135,sbp:55, dbp:35,rr:40,weight:3.5, label:'Neonate'};
+  if(ageyrs < 0.5)   return {hr:135,sbp:65, dbp:40,rr:36,weight:5,   label:'Young infant'};
+  if(ageyrs < 1)     return {hr:125,sbp:70, dbp:45,rr:30,weight:8,   label:'Infant'};
+  if(ageyrs < 2)     return {hr:115,sbp:76, dbp:48,rr:26,weight:11,  label:'Toddler'};
+  if(ageyrs < 5)     return {hr:100,sbp:82, dbp:50,rr:22,weight:16,  label:'Preschool'};
+  if(ageyrs < 8)     return {hr:90, sbp:88, dbp:54,rr:20,weight:23,  label:'School age'};
+  if(ageyrs < 12)    return {hr:82, sbp:94, dbp:58,rr:18,weight:35,  label:'Older child'};
+  if(ageyrs < 16)    return {hr:75, sbp:100,dbp:62,rr:16,weight:55,  label:'Adolescent'};
+  return               {hr:72, sbp:112,dbp:70,rr:14,weight:70, label:'Adult'};
 }
 
 // Default toddler when peds mode with no age specified
@@ -58,8 +60,15 @@ function setPatientAge(ageyrs) {
     rr:   norms.rr,
     etco2:35
   };
-  // Apply to current state
-  Object.assign(S, P.baseline);
+  // Apply directly to engine S — override any adult defaults
+  S.hr   = norms.hr;
+  S.sbp  = norms.sbp;
+  S.dbp  = norms.dbp;
+  S.spo2 = 98;
+  S.rr   = norms.rr;
+  S.etco2= 35;
+  // Clear any active transitions so adult values don't bleed in
+  TR = {};
   _emit('patient');
   _emit('state');
 }
@@ -1218,7 +1227,7 @@ global.MedSimCore = {
   // Preoxygenation
   setPreoxygenated: function(v){ _preoxygenated = v; },
   // Version
-  version:          '1.2'
+  version:          '1.3'
 };
 
 })(typeof window !== 'undefined' ? window : global);
