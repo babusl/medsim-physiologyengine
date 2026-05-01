@@ -23,12 +23,46 @@
 //  PATIENT PARAMETERS
 // ═══════════════════════════════════════════════════════════════════════════════
 var P = {
-  mode:    'adult',    // 'adult' | 'peds'
-  weight:  70,         // kg — used for weight-based dosing
-  age:     35,         // years
-  // Baseline vitals (set when patient mode changes or scenario loads)
+  mode:    'adult',
+  weight:  70,
+  age:     35,
   baseline: { hr:72, sbp:120, dbp:80, spo2:98, rr:14, etco2:35 }
 };
+
+// Age-based normal vitals
+// Returns {hr, sbp, dbp, rr, weight_kg} for a given age in years
+function ageNorms(ageyrs) {
+  if(ageyrs < 0.08)  return {hr:140,sbp:70, dbp:45,rr:40,weight:3.5,label:'Neonate'};
+  if(ageyrs < 0.5)   return {hr:140,sbp:80, dbp:50,rr:36,weight:5,  label:'Young infant'};
+  if(ageyrs < 1)     return {hr:130,sbp:85, dbp:55,rr:30,weight:8,  label:'Infant'};
+  if(ageyrs < 2)     return {hr:120,sbp:90, dbp:58,rr:26,weight:11, label:'Toddler'};
+  if(ageyrs < 5)     return {hr:105,sbp:95, dbp:62,rr:22,weight:16, label:'Preschool'};
+  if(ageyrs < 8)     return {hr:95, sbp:100,dbp:65,rr:20,weight:23, label:'School age'};
+  if(ageyrs < 12)    return {hr:88, sbp:105,dbp:68,rr:18,weight:35, label:'Older child'};
+  if(ageyrs < 16)    return {hr:80, sbp:112,dbp:72,rr:16,weight:55, label:'Adolescent'};
+  return               {hr:72, sbp:120,dbp:80,rr:14,weight:70, label:'Adult'};
+}
+
+// Default toddler when peds mode with no age specified
+var DEFAULT_PEDS_AGE = 3;
+
+function setPatientAge(ageyrs) {
+  P.age = ageyrs;
+  var norms = ageNorms(ageyrs);
+  P.weight = norms.weight;
+  P.baseline = {
+    hr:   norms.hr,
+    sbp:  norms.sbp,
+    dbp:  norms.dbp,
+    spo2: 98,
+    rr:   norms.rr,
+    etco2:35
+  };
+  // Apply to current state
+  Object.assign(S, P.baseline);
+  _emit('patient');
+  _emit('state');
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PHYSIOLOGIC STATE
@@ -143,18 +177,21 @@ var DRUGS = {
   epinephrine_push: {
     mode: 'iv',
     effects: function(dose, weight, mode){
-      // dose in mcg. α1+β1+β2. "Rocket fuel."
-      // 10mcg: HR ↑ 20-30, SBP ↑ 25-35
-      // 50mcg: HR ↑ 45-60 (low 100s from baseline 70s), SBP ↑ 50-70
-      // 100mcg+: HR into 120-140s, SBP ↑ 70-90
+      // α1+β1+β2. If bronchospasm active, β2 bronchodilates.
+      // Wears off → bronchospasm can return
       var intensity = Math.min(1.0, dose / 50);
+      if(S.ventPath === 'bronchospasm' || S.ventPath === 'laryngospasm'){
+        _applyBronchodilation(0.5 * intensity); // partial — wears off faster than albuterol
+        _schedulePathReturn(180); // bronchospasm can return after 3 min
+      }
       return {
-        hr:  Math.round(20 + intensity * 55),   // 20 at 10mcg → 75 at 50mcg
+        hr:  Math.round(20 + intensity * 55),
         sbp: Math.round(25 + intensity * 55),
-        dbp: Math.round(10 + intensity * 22)
+        dbp: Math.round(10 + intensity * 22),
+        spo2: S.ventPath==='bronchospasm' ? Math.min(98, S.spo2 + Math.round(intensity*8)) : 0
       };
     },
-    offset: function(dose){ return 180; } // ~3 min
+    offset: function(dose){ return 180; }
   },
 
   epinephrine_code: {  // 1mg IV push, cardiac arrest
@@ -569,16 +606,15 @@ var DRUGS = {
   // ─────────────────────────────────────────────────────────────────────────────
 
   albuterol: {
-    mode: 'iv', // same fast transition — enters lungs quickly when inhaled
+    mode: 'iv',
     effects: function(dose, weight, mode){
-      // β2: bronchodilation (handled via ventPath change), β1 spillover: HR ↑ mild
-      return {
-        hr: 8,
-        // Vent mechanics improved — set compliance/resistance directly
-        _vent: { resistance: Math.max(5, S.resistance - 15), compliance: Math.min(50, S.compliance + 8) }
-      };
+      // β2: bronchodilation. Near-instantaneous as enters lungs.
+      // β1 spillover: HR ↑ mild
+      // Improves resistance → SpO2 ↑, EtCO2 normalizes, waveform returns to normal
+      _applyBronchodilation(0.7); // 70% relief
+      return { hr: 8, spo2: Math.min(98, S.spo2 + 6), etco2: Math.max(35, S.etco2 - 8) };
     },
-    offset: function(){ return 1200; } // 20 min, then possible bronchospasm return
+    offset: function(){ return 1200; } // 20 min
   },
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -794,6 +830,57 @@ function stepInfusions(dt){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  BRONCHODILATION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+var _pathReturnTimer = null;
+
+function _applyBronchodilation(relief) {
+  // relief: 0-1 — fraction of bronchospasm relieved
+  // Improves compliance/resistance, improves SpO2, normalizes EtCO2
+  var baseCompliance = 50, baseResistance = 5;
+  var currentRelief = Math.min(1, Math.max(0, relief));
+  S.compliance = Math.round(S.compliance + (baseCompliance - S.compliance) * currentRelief);
+  S.resistance  = Math.round(S.resistance  - (S.resistance  - baseResistance)  * currentRelief);
+  // Emit vent change so monitor waveform updates
+  _emit('vent');
+}
+
+function _schedulePathReturn(seconds) {
+  // After epi wears off, bronchospasm can partially return
+  if(_pathReturnTimer) clearTimeout(_pathReturnTimer);
+  _pathReturnTimer = setTimeout(function(){
+    if(S.ventPath === 'bronchospasm') {
+      // Partial return — resistance creeps back up
+      S.resistance = Math.min(35, S.resistance + 12);
+      S.compliance = Math.max(38, S.compliance - 8);
+      _emit('vent');
+      _emit('state');
+    }
+  }, seconds * 1000);
+}
+
+// ── BRONCHOSPASM AUTOMATIC PHYSIOLOGY ────────────────────────────────────────
+// Called from monitor when ventPath set to bronchospasm
+// Sets EtCO2 rising, SpO2 drop with time constant, BP drop in severe
+function applyBronchospasmPhysiology(stage) {
+  // stage 1: mild. stage 2: severe.
+  if(stage === 1) {
+    // EtCO2 rises (CO2 retention from air trapping)
+    trSet({ etco2: 48, hr: 98 }, 'path');
+    // SpO2 drop has time constant — takes 30-60s
+    setTimeout(function(){
+      if(S.ventPath === 'bronchospasm') trSet({ spo2: 90 }, 'path');
+    }, 30000);
+  } else {
+    // Severe: EtCO2 higher, BP drops (obstructive → ↓ venous return)
+    trSet({ etco2: 62, hr: 115, sbp: Math.max(80, S.sbp - 22), dbp: Math.max(45, S.dbp - 14) }, 'path');
+    setTimeout(function(){
+      if(S.ventPath === 'bronchospasm') trSet({ spo2: 80 }, 'path');
+    }, 20000);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  MAIN give() FUNCTION — called when any drug or intervention is given
 // ═══════════════════════════════════════════════════════════════════════════════
 function give(drugKey, dose, opts){
@@ -876,6 +963,97 @@ function clamp(){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  HYPOXIA RESPONSE ENGINE
+//  Adults:  SpO2 drop → tachycardia first, then brady below ~50%
+//  Peds:    SpO2 < 80% → immediate bradycardia, proportional to rate of drop
+//           Smaller child = faster decompensation
+//           HR < 60 = pre-arrest in peds
+// ═══════════════════════════════════════════════════════════════════════════════
+var _lastSpo2 = 98;         // track previous SpO2 to compute slope
+var _spo2DropRate = 0;      // units/sec — rate of SpO2 fall
+var _hypoxiaTimer = 0;      // accumulates time spent hypoxic
+var _preoxygenated = false; // slows desaturation curve
+
+function _hypoxiaStep(dt) {
+  var spo2 = S.spo2;
+  var hr   = S.hr;
+  var isPeds = P.mode === 'peds';
+  var age  = P.age || (isPeds ? DEFAULT_PEDS_AGE : 35);
+
+  // Compute rate of SpO2 drop (smoothed)
+  var rawDrop = (_lastSpo2 - spo2) / Math.max(dt, 0.016);
+  _spo2DropRate = _spo2DropRate * 0.9 + rawDrop * 0.1; // exponential smoothing
+  _lastSpo2 = spo2;
+
+  // Only act if actively desaturating or already hypoxic
+  if(spo2 >= 94 && _spo2DropRate < 0.5) return;
+
+  // Decompensation speed factor: smaller child = faster
+  var speedFactor = isPeds ? Math.max(0.6, Math.min(2.5, 10 / Math.max(1, age))) : 1.0;
+  // Preoxygenation slows the drop
+  if(_preoxygenated) speedFactor *= isPeds ? 0.65 : 0.35;
+
+  if(isPeds) {
+    // ── PEDS: brady starts at SpO2 < 80%, accelerates with slope ──────────
+    if(spo2 < 80) {
+      _hypoxiaTimer += dt * speedFactor;
+      // HR target drops proportionally to depth AND rate of hypoxia
+      var depth  = Math.max(0, (80 - spo2) / 80);     // 0 at SpO2=80, 1 at SpO2=0
+      var slope  = Math.min(1, _spo2DropRate / 3.0);   // how fast sat is falling
+      var combined = Math.min(1, depth * 0.7 + slope * 0.3); // weighted
+      var baseline_hr = P.baseline.hr || 120;
+      var hrTarget = Math.round(baseline_hr - combined * (baseline_hr - 20));
+      hrTarget = Math.max(0, hrTarget);
+      // Rate of HR drop scales with speed factor
+      if(!TR['hr'] || TR['hr'].target > hrTarget) {
+        TR['hr'] = { target: hrTarget, rate: 1.5 * speedFactor };
+      }
+      // BP follows HR down in severe hypoxia
+      if(spo2 < 60) {
+        var bpFrac = Math.max(0, (spo2 - 20) / 40); // 0 at spo2=20, 1 at spo2=60
+        TR['sbp'] = { target: Math.round(50 + bpFrac * (P.baseline.sbp - 50)), rate: 1.2 * speedFactor };
+        TR['dbp'] = { target: Math.round(20 + bpFrac * (P.baseline.dbp - 20)), rate: 1.0 * speedFactor };
+      }
+      // Arrest if HR < 60 and persists
+      if(S.hr < 60 && spo2 < 60 && _hypoxiaTimer > 15) {
+        S.rhythm = 'PEA';
+        TR['hr']  = { target:0, rate:5 };
+        TR['sbp'] = { target:0, rate:5 };
+        TR['dbp'] = { target:0, rate:5 };
+        _hypoxiaTimer = 0;
+      }
+    } else {
+      _hypoxiaTimer = Math.max(0, _hypoxiaTimer - dt);
+    }
+  } else {
+    // ── ADULT: tachycardia first, brady only in severe prolonged hypoxia ───
+    if(spo2 < 85 && spo2 >= 70) {
+      // Mild-moderate: tachycardic response
+      var tachyDelta = Math.round((85 - spo2) * 1.5); // ~22bpm at SpO2 70%
+      var tachyTarget = Math.min(140, (P.baseline.hr||72) + tachyDelta);
+      if(!TR['hr'] || Math.abs(TR['hr'].target - tachyTarget) > 5) {
+        TR['hr'] = { target: tachyTarget, rate: 0.8 };
+      }
+    } else if(spo2 < 70 && spo2 >= 50) {
+      // Moderate-severe: peak tachy then starts dropping
+      var sevTarget = Math.min(150, (P.baseline.hr||72) + 35);
+      if(!TR['hr'] || TR['hr'].target < sevTarget) {
+        TR['hr'] = { target: sevTarget, rate: 1.0 };
+      }
+      // BP starts dropping
+      TR['sbp'] = { target: Math.max(70, S.sbp - 0.3), rate: 0.3 };
+    } else if(spo2 < 50) {
+      // Severe: brady begins
+      _hypoxiaTimer += dt;
+      var bradyTarget = Math.max(30, (P.baseline.hr||72) - Math.round((50-spo2)*1.2));
+      TR['hr']  = { target: bradyTarget, rate: 1.0 };
+      TR['sbp'] = { target: Math.max(40, 90 - (50-spo2)*1.5), rate: 0.8 };
+      TR['dbp'] = { target: Math.max(15, 60 - (50-spo2)*1.0), rate: 0.6 };
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  STEP — called every animation frame (dt = seconds since last call)
 // ═══════════════════════════════════════════════════════════════════════════════
 var _trThrottle = 0;
@@ -893,18 +1071,8 @@ function step(dt){
     changed = true;
   });
 
-  // Laryngospasm physiology
-  if(_laryngoPhase >= 1 && S.spo2 < 70){
-    var t = Math.min(1, Math.max(0, (70 - S.spo2) / 40));
-    var isPeds = P.mode === 'peds';
-    // Peds: HR drops fast. Adults: HR drops slower.
-    var hrFloor = isPeds ? 20 : 40;
-    var hrRoof  = isPeds ? 95 : 90;
-    TR['hr']  = { target: Math.round(hrRoof - (hrRoof-hrFloor)*t),  rate: isPeds ? 3.5 : 2.5 };
-    TR['sbp'] = { target: Math.round(110   - (110-35)*t),           rate: RATES.laryngo2.sbp };
-    TR['dbp'] = { target: Math.round(70    - (70-12)*t),            rate: RATES.laryngo2.dbp };
-    changed = true;
-  }
+  // Run hypoxia engine every frame
+  _hypoxiaStep(dt);
 
   // EtCO2 recovery after ROSC
   var perfusing = !(S.rhythm==='VFib'||S.rhythm==='Asystole'||S.rhythm==='PEA');
@@ -1042,8 +1210,15 @@ global.MedSimCore = {
   CATALOG:          CATALOG,
   DRUGS:            DRUGS,
   RATES:            RATES,
+  // Patient
+  setPatientAge:    setPatientAge,
+  ageNorms:         ageNorms,
+  // Bronchospasm
+  applyBronchospasmPhysiology: applyBronchospasmPhysiology,
+  // Preoxygenation
+  setPreoxygenated: function(v){ _preoxygenated = v; },
   // Version
-  version:          '1.1'
+  version:          '1.2'
 };
 
 })(typeof window !== 'undefined' ? window : global);
